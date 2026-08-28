@@ -22,6 +22,22 @@ import {
   type WeatherCell,
 } from '@/lib/ololink';
 import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+import {
+  DOWNLINK_TARGETS,
+  SAT_ORBITS,
+  SATELLITES,
+  orbitPosition,
+  orbitTangent,
+  staticPosition,
+  windowScore,
+} from '@/lib/orbits';
+
+/** Live scene positions for every asset — satellites are updated every frame. */
+type LiveMap = Map<string, THREE.Vector3>;
+
+function createLiveMap(): LiveMap {
+  return new Map(ASSETS.map((a) => [a.id, staticPosition(a)]));
+}
 
 const CYAN = '#38bdf8';
 const UP = new THREE.Vector3(0, 1, 0);
@@ -144,26 +160,74 @@ function Earth() {
 /* --------------------------------------------- orbital trajectory rings */
 /* Deliberately near-invisible: these are mechanics, not communication. */
 
-function OrbitRing({ radius, tilt, spin }: { radius: number; tilt: number; spin: number }) {
+function OrbitTrack({ elId }: { elId: string }) {
   const geometry = useMemo(() => {
-    const pts = Array.from({ length: 161 }, (_, i) => {
-      const a = (i / 160) * Math.PI * 2;
-      return new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius);
+    const el = SAT_ORBITS[elId]!;
+    const pts = Array.from({ length: 181 }, (_, i) => {
+      const a = (i / 180) * Math.PI * 2;
+      return el.e1
+        .clone()
+        .multiplyScalar(Math.cos(a) * el.radius)
+        .addScaledVector(el.e2, Math.sin(a) * el.radius);
     });
     const g = new THREE.BufferGeometry().setFromPoints(pts);
     g.computeBoundingSphere();
     return g;
-  }, [radius]);
-  const ref = useRef<THREE.Object3D>(null);
-  useFrame((_, d) => {
-    if (ref.current) ref.current.rotation.y += d * spin;
-  });
+  }, [elId]);
   return (
     // @ts-expect-error three line primitive
-    <line ref={ref} geometry={geometry} rotation={[tilt, 0, tilt * 0.4]}>
-      <lineBasicMaterial color="#7dd3fc" transparent opacity={0.055} depthWrite={false} />
+    <line geometry={geometry}>
+      <lineBasicMaterial color="#7dd3fc" transparent opacity={0.06} depthWrite={false} />
     </line>
   );
+}
+
+/**
+ * Propagates the visual LEO model and evaluates communication windows.
+ * Concept simulation only — circular paths, accelerated rates.
+ */
+function OrbitDriver({ state, live }: { state: OloLinkState; live: LiveMap }) {
+  const acc = useRef(0);
+  const tmp = useRef(new THREE.Vector3());
+
+  useFrame(({ clock }, d) => {
+    const t = clock.elapsedTime;
+    for (const sat of SATELLITES) {
+      const el = SAT_ORBITS[sat.id];
+      const target = live.get(sat.id);
+      if (el && target) orbitPosition(el, t, target);
+    }
+
+    if (!state.running) return;
+    acc.current += d;
+    if (acc.current < 0.5) return;
+    acc.current = 0;
+
+    for (const rx of DOWNLINK_TARGETS) {
+      const receiver = live.get(rx.id);
+      if (!receiver) continue;
+      let bestId: string | null = null;
+      let best = 0;
+      for (const satId of rx.sats) {
+        const pos = live.get(satId);
+        if (!pos) continue;
+        const score = windowScore(tmp.current.copy(pos), receiver);
+        if (score > best) {
+          best = score;
+          bestId = satId;
+        }
+      }
+      // hysteresis: hold an acquired link until the window really closes
+      const held = state.windows[rx.id] ?? null;
+      if (held && held !== bestId) {
+        const heldPos = live.get(held);
+        if (heldPos && windowScore(tmp.current.copy(heldPos), receiver) > 0.18) continue;
+      }
+      state.reportWindow(rx.id, best > 0.24 ? bestId : null);
+    }
+  });
+
+  return null;
 }
 
 /* --------------------------------------------------- link helper meshes */
@@ -224,6 +288,176 @@ function DashedLine({
         depthWrite={false}
       />
     </line>
+  );
+}
+
+/**
+ * Live satellite downlink: geometry is re-sampled every frame from the moving
+ * satellite, and the optical beam only exists inside a communication window.
+ */
+function DownlinkBeam({
+  link,
+  live,
+  inWindow,
+  selected,
+  highlighted,
+  onSelect,
+}: {
+  link: LinkState;
+  live: LiveMap;
+  inWindow: boolean;
+  selected: boolean;
+  highlighted: boolean;
+  onSelect: (s: Selection) => void;
+}) {
+  const N = 40;
+  const meta = TECH_META[link.segment.tech];
+  const blocked = link.status === 'UNAVAILABLE';
+  const degraded = link.status === 'DEGRADED';
+  const active = inWindow && !blocked;
+
+  const core = useRef<THREE.Line>(null);
+  const sheath = useRef<THREE.Line>(null);
+  const packs = useRef<THREE.Group>(null);
+  const hit = useRef<THREE.Mesh>(null);
+  const vis = useRef(0);
+  const flow = useRef(Math.random());
+
+  const geometry = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4);
+    return g;
+  }, []);
+
+  const scratch = useMemo(
+    () => ({
+      a: new THREE.Vector3(),
+      b: new THREE.Vector3(),
+      mid: new THREE.Vector3(),
+      p: new THREE.Vector3(),
+      q: new THREE.Vector3(),
+    }),
+    []
+  );
+
+  useFrame((_, d) => {
+    const from = live.get(link.segment.from);
+    const to = live.get(link.segment.to);
+    if (!from || !to) return;
+
+    const target = active ? 1 : 0;
+    vis.current += (target - vis.current) * Math.min(1, d * 1.8);
+    flow.current = (flow.current + d * 0.5) % 1;
+
+    const { a, b, mid, p, q } = scratch;
+    a.copy(from);
+    b.copy(to);
+    mid.copy(a).add(b).multiplyScalar(0.5);
+    mid.setLength(Math.max(a.length(), b.length()) * (1 + a.distanceTo(b) * 0.03));
+
+    const attr = geometry.getAttribute('position') as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const inv = 1 - t;
+      p.copy(a)
+        .multiplyScalar(inv * inv)
+        .addScaledVector(mid, 2 * inv * t)
+        .addScaledVector(b, t * t);
+      arr[i * 3] = p.x;
+      arr[i * 3 + 1] = p.y;
+      arr[i * 3 + 2] = p.z;
+    }
+    attr.needsUpdate = true;
+
+    const bezier = (t: number, out: THREE.Vector3) => {
+      const inv = 1 - t;
+      return out
+        .copy(a)
+        .multiplyScalar(inv * inv)
+        .addScaledVector(mid, 2 * inv * t)
+        .addScaledVector(b, t * t);
+    };
+
+    const boost = highlighted || selected ? 1.3 : 1;
+    const v = vis.current;
+    if (core.current) {
+      const m = core.current.material as THREE.LineBasicMaterial;
+      m.opacity = v * 0.85 * boost;
+      m.color.set(degraded ? '#fcd34d' : '#e0f2fe');
+      core.current.visible = v > 0.01;
+    }
+    if (sheath.current) {
+      const m = sheath.current.material as THREE.LineBasicMaterial;
+      // faint standby trace stays when the window is closed
+      m.opacity = blocked ? 0.05 : 0.05 + v * 0.35 * boost;
+      m.color.set(blocked ? '#fb7185' : degraded ? '#fbbf24' : meta.color);
+    }
+    if (packs.current) {
+      packs.current.visible = v > 0.05;
+      packs.current.children.forEach((child, i) => {
+        const t = (flow.current + i / packs.current!.children.length) % 1;
+        child.position.copy(bezier(t, q));
+        const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+        mat.opacity = v * (0.5 + 0.5 * Math.sin(t * Math.PI)) * 0.95;
+      });
+    }
+    if (hit.current) hit.current.position.copy(bezier(0.5, q));
+  });
+
+  return (
+    <group>
+      {/* @ts-expect-error three line primitive */}
+      <line ref={sheath} geometry={geometry}>
+        <lineBasicMaterial
+          color={meta.color}
+          transparent
+          opacity={0.06}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </line>
+      {/* @ts-expect-error three line primitive */}
+      <line ref={core} geometry={geometry}>
+        <lineBasicMaterial
+          color="#e0f2fe"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </line>
+      <group ref={packs}>
+        {[0, 1, 2, 3].map((i) => (
+          <mesh key={i}>
+            <sphereGeometry args={[0.0045, 8, 8]} />
+            <meshBasicMaterial
+              color="#f0f9ff"
+              transparent
+              opacity={0}
+              depthWrite={false}
+              blending={THREE.AdditiveBlending}
+            />
+          </mesh>
+        ))}
+      </group>
+      <mesh
+        ref={hit}
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onSelect({ type: 'link', id: link.segment.id });
+        }}
+      >
+        <sphereGeometry args={[0.018, 8, 8]} />
+        <meshBasicMaterial
+          color={meta.color}
+          transparent
+          opacity={selected ? 0.22 : 0.02}
+          depthWrite={false}
+        />
+      </mesh>
+    </group>
   );
 }
 
@@ -710,19 +944,26 @@ function AssetNode({
   onRoute,
   onSelect,
   showLabel,
+  live,
+  linking,
 }: {
   asset: Asset;
   selected: boolean;
   onRoute: boolean;
   onSelect: (s: Selection) => void;
   showLabel: boolean;
+  live: LiveMap;
+  /** node is inside an active communication window */
+  linking?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const position = useMemo(() => vec(asset), [asset]);
   const quat = useMemo(() => surfaceQuat(position), [position]);
   const ring = useRef<THREE.Mesh>(null);
   const body = useRef<THREE.Group>(null);
-  const color = selected || hover ? '#ffffff' : KIND_COLOR[asset.kind];
+  const root = useRef<THREE.Group>(null);
+  const orbiting = asset.kind === 'satellite';
+  const color = selected || hover ? '#ffffff' : linking ? '#e0f2fe' : KIND_COLOR[asset.kind];
 
   const s =
     asset.kind === 'satellite'
@@ -734,6 +975,13 @@ function AssetNode({
           : 0.015;
 
   useFrame(({ clock, camera }) => {
+    if (root.current) {
+      const p = live.get(asset.id);
+      if (p) {
+        root.current.position.copy(p);
+        if (orbiting) root.current.quaternion.copy(surfaceQuat(p));
+      }
+    }
     if (body.current) {
       const target = selected ? 1.45 : hover ? 1.2 : 1;
       body.current.scale.lerp(new THREE.Vector3(target, target, target), 0.12);
@@ -743,12 +991,12 @@ function AssetNode({
       const p = (clock.elapsedTime * 0.55) % 1;
       ring.current.scale.setScalar(1 + p * 2.6);
       (ring.current.material as THREE.MeshBasicMaterial).opacity =
-        (1 - p) * (selected ? 0.55 : onRoute ? 0.28 : 0);
+        (1 - p) * (selected ? 0.55 : linking ? 0.42 : onRoute ? 0.28 : 0);
     }
   });
 
   return (
-    <group position={position} quaternion={quat}>
+    <group ref={root} position={position} quaternion={quat}>
       <group
         ref={body}
         onPointerOver={(e) => {
@@ -781,7 +1029,7 @@ function AssetNode({
       <mesh ref={ring}>
         <ringGeometry args={[s * 1.9, s * 2.2, 32]} />
         <meshBasicMaterial
-          color={KIND_COLOR[asset.kind]}
+          color={linking ? '#e0f2fe' : KIND_COLOR[asset.kind]}
           transparent
           opacity={0}
           side={THREE.DoubleSide}
@@ -897,23 +1145,38 @@ function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }
 /* --------------------------------------------------------- camera focus */
 
 function CameraRig({
-  target,
+  focusIds,
+  live,
   approach,
   controls,
 }: {
-  target: THREE.Vector3 | null;
+  focusIds: string[] | null;
+  live: LiveMap;
   approach: number;
   controls: React.RefObject<any>;
 }) {
   const desired = useRef(new THREE.Vector3());
+  const target = useRef(new THREE.Vector3());
   useFrame(({ camera }, d) => {
     const c = controls.current;
     if (!c) return;
     const k = 1 - Math.exp(-2.6 * d);
-    if (target) {
-      c.target.lerp(target, k);
-      const dist = Math.max(1.42, target.length() + approach);
-      desired.current.copy(target).setLength(dist);
+    if (focusIds && focusIds.length) {
+      target.current.set(0, 0, 0);
+      let n = 0;
+      for (const id of focusIds) {
+        const p = live.get(id);
+        if (p) {
+          target.current.add(p);
+          n += 1;
+        }
+      }
+      if (n === 0) return;
+      target.current.multiplyScalar(1 / n);
+      const t = target.current;
+      c.target.lerp(t, k);
+      const dist = Math.max(1.42, t.length() + approach);
+      desired.current.copy(t).setLength(dist);
       camera.position.lerp(desired.current, k * 0.95);
     } else {
       c.target.lerp(new THREE.Vector3(0, 0, 0), k * 0.6);
@@ -939,17 +1202,24 @@ function SceneContent({ state }: { state: OloLinkState }) {
     return new Set([selection.id]);
   }, [selection, routeSegmentIds]);
 
+  const live = useMemo(createLiveMap, []);
+
+  /** satellites currently holding a communication window, by receiver */
+  const windowSats = useMemo(
+    () => new Set(Object.values(state.windows).filter(Boolean) as string[]),
+    [state.windows]
+  );
+  const windowReceivers = useMemo(
+    () => new Set(Object.entries(state.windows).filter(([, v]) => v).map(([k]) => k)),
+    [state.windows]
+  );
+
   const focus = useMemo(() => {
     if (!selection) return null;
-    if (selection.type === 'asset') {
-      const a = ASSET_BY_ID[selection.id];
-      return a ? vec(a) : null;
-    }
+    if (selection.type === 'asset') return [selection.id];
     const l = links.find((x) => x.segment.id === selection.id);
     if (!l) return null;
-    const a = ASSET_BY_ID[l.segment.from]!;
-    const b = ASSET_BY_ID[l.segment.to]!;
-    return vec(a).add(vec(b)).multiplyScalar(0.5);
+    return [l.segment.from, l.segment.to];
   }, [selection, links]);
 
   const approach = selection?.type === 'asset' ? 0.42 : 0.85;
@@ -976,39 +1246,47 @@ function SceneContent({ state }: { state: OloLinkState }) {
         <Earth />
       </Suspense>
 
-      {layers.orbits && (
-        <>
-          <OrbitRing radius={1.16} tilt={0.42} spin={0.02} />
-          <OrbitRing radius={1.22} tilt={-0.6} spin={-0.015} />
-          <OrbitRing radius={1.28} tilt={0.18} spin={0.01} />
-        </>
-      )}
+      <OrbitDriver state={state} live={live} />
+
+      {layers.orbits && SATELLITES.map((a) => <OrbitTrack key={a.id} elId={a.id} />)}
 
       {layers.routes &&
-        links.map((l) => (
-          <LinkPath
-            key={l.segment.id}
-            link={l}
-            selected={selection?.type === 'link' && selection.id === l.segment.id}
-            onRoute={routeSegmentIds.has(l.segment.id)}
-            highlighted={highlightIds.has(l.segment.id)}
-            onSelect={select}
-          />
-        ))}
+        links.map((l) =>
+          ASSET_BY_ID[l.segment.from]?.kind === 'satellite' ? (
+            <DownlinkBeam
+              key={l.segment.id}
+              link={l}
+              live={live}
+              inWindow={state.windows[l.segment.to] === l.segment.from}
+              selected={selection?.type === 'link' && selection.id === l.segment.id}
+              highlighted={highlightIds.has(l.segment.id)}
+              onSelect={select}
+            />
+          ) : (
+            <LinkPath
+              key={l.segment.id}
+              link={l}
+              selected={selection?.type === 'link' && selection.id === l.segment.id}
+              onRoute={routeSegmentIds.has(l.segment.id)}
+              highlighted={highlightIds.has(l.segment.id)}
+              onSelect={select}
+            />
+          )
+        )}
 
       {/* AI rerouting: old path dissolves, new path draws itself in */}
       {layers.routes && previousRoute && previousRoute.length > 0 && (
         <>
           <ProgressiveRoute
             key={`out-${rerouteSeq}`}
-            segments={previousRoute}
+            segments={previousRoute.filter((sg) => ASSET_BY_ID[sg.from]?.kind !== 'satellite')}
             seq={rerouteSeq}
             mode="out"
             color="#94a3b8"
           />
           <ProgressiveRoute
             key={`in-${rerouteSeq}`}
-            segments={route}
+            segments={route.filter((sg) => ASSET_BY_ID[sg.from]?.kind !== 'satellite')}
             seq={rerouteSeq}
             mode="in"
             color="#e0f2fe"
@@ -1023,7 +1301,9 @@ function SceneContent({ state }: { state: OloLinkState }) {
           selected={selection?.type === 'asset' && selection.id === a.id}
           onRoute={routeAssets.has(a.id)}
           onSelect={select}
-          showLabel={layers.labels && routeAssets.has(a.id)}
+          showLabel={layers.labels && (routeAssets.has(a.id) || windowSats.has(a.id))}
+          live={live}
+          linking={windowSats.has(a.id) || windowReceivers.has(a.id)}
         />
       ))}
 
@@ -1040,7 +1320,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
         autoRotate={!selection && state.running}
         autoRotateSpeed={0.22}
       />
-      <CameraRig target={focus} approach={approach} controls={controls} />
+      <CameraRig focusIds={focus} live={live} approach={approach} controls={controls} />
     </>
   );
 }

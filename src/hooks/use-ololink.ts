@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ASSET_BY_ID,
   SCENARIOS,
   linkStates,
   routeSegments,
@@ -73,6 +74,9 @@ export interface OloLinkState {
   running: boolean;
   layers: { weather: boolean; orbits: boolean; labels: boolean; routes: boolean };
   techFilter: Record<Tech, boolean>;
+  /** receiverId -> satellite id currently inside a simulated communication window */
+  windows: Record<string, string | null>;
+  reportWindow: (receiverId: string, satId: string | null) => void;
   toggleTech: (t: Tech) => void;
   setScenario: (id: ScenarioId) => void;
   setPanel: (id: RailId | null) => void;
@@ -82,6 +86,7 @@ export interface OloLinkState {
   setRunning: (v: boolean) => void;
   approve: () => void;
 }
+
 
 export function useOloLink(): OloLinkState {
   const [scenarioId, setScenarioId] = useState<ScenarioId>('clear');
@@ -102,6 +107,7 @@ export function useOloLink(): OloLinkState {
     FIBER: true,
   });
   const [telemetry, setTelemetry] = useState<Telemetry>(SCENARIOS.clear.telemetry);
+  const [windows, setWindows] = useState<Record<string, string | null>>({});
   const [events, setEvents] = useState<EventEntry[]>([
     { id: 'e0', time: 'T+00:00', level: 'INFO', text: 'Orchestration session initialised' },
     { id: 'e1', time: 'T+00:02', level: 'OK', text: 'Constellation handshake complete' },
@@ -111,6 +117,7 @@ export function useOloLink(): OloLinkState {
 
   const profile = SCENARIOS[scenarioId];
 
+
   const push = useCallback((level: EventEntry['level'], text: string) => {
     setEvents((prev) => {
       counter.current += 1;
@@ -118,6 +125,26 @@ export function useOloLink(): OloLinkState {
       return [...prev.slice(-60), { id, time: formatT(clock.current), level, text }];
     });
   }, []);
+
+  const reportWindow = useCallback(
+    (receiverId: string, satId: string | null) => {
+      setWindows((prev) => {
+        const current = prev[receiverId] ?? null;
+        if (current === satId) return prev;
+        const rx = ASSET_BY_ID[receiverId]?.name ?? receiverId;
+        if (satId && current) {
+          push('OK', `Handover ${ASSET_BY_ID[current]?.name ?? current} → ${ASSET_BY_ID[satId]?.name ?? satId} at ${rx}`);
+        } else if (satId) {
+          push('OK', `Comm window acquired: ${ASSET_BY_ID[satId]?.name ?? satId} → ${rx}`);
+        } else if (current) {
+          push('INFO', `Comm window closed: ${ASSET_BY_ID[current]?.name ?? current} → ${rx}`);
+        }
+        return { ...prev, [receiverId]: satId };
+      });
+    },
+    [push]
+  );
+
 
   useEffect(() => {
     if (!running) return;
@@ -209,6 +236,8 @@ export function useOloLink(): OloLinkState {
     running,
     layers,
     techFilter,
+    windows,
+    reportWindow,
     toggleTech: (t) => setTechFilter((f) => ({ ...f, [t]: !f[t] })),
     setScenario,
     setPanel,
