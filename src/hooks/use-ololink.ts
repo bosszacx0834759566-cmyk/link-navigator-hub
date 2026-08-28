@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ASSET_BY_ID,
   SCENARIOS,
   linkStates,
   routeSegments,
@@ -235,6 +236,8 @@ export function useOloLink(): OloLinkState {
     running,
     layers,
     techFilter,
+    windows,
+    reportWindow,
     toggleTech: (t) => setTechFilter((f) => ({ ...f, [t]: !f[t] })),
     setScenario,
     setPanel,
