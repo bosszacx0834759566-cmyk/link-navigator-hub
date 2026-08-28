@@ -73,6 +73,9 @@ export interface OloLinkState {
   running: boolean;
   layers: { weather: boolean; orbits: boolean; labels: boolean; routes: boolean };
   techFilter: Record<Tech, boolean>;
+  /** receiverId -> satellite id currently inside a simulated communication window */
+  windows: Record<string, string | null>;
+  reportWindow: (receiverId: string, satId: string | null) => void;
   toggleTech: (t: Tech) => void;
   setScenario: (id: ScenarioId) => void;
   setPanel: (id: RailId | null) => void;
@@ -82,6 +85,7 @@ export interface OloLinkState {
   setRunning: (v: boolean) => void;
   approve: () => void;
 }
+
 
 export function useOloLink(): OloLinkState {
   const [scenarioId, setScenarioId] = useState<ScenarioId>('clear');
