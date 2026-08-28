@@ -1145,23 +1145,38 @@ function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }
 /* --------------------------------------------------------- camera focus */
 
 function CameraRig({
-  target,
+  focusIds,
+  live,
   approach,
   controls,
 }: {
-  target: THREE.Vector3 | null;
+  focusIds: string[] | null;
+  live: LiveMap;
   approach: number;
   controls: React.RefObject<any>;
 }) {
   const desired = useRef(new THREE.Vector3());
+  const target = useRef(new THREE.Vector3());
   useFrame(({ camera }, d) => {
     const c = controls.current;
     if (!c) return;
     const k = 1 - Math.exp(-2.6 * d);
-    if (target) {
-      c.target.lerp(target, k);
-      const dist = Math.max(1.42, target.length() + approach);
-      desired.current.copy(target).setLength(dist);
+    if (focusIds && focusIds.length) {
+      target.current.set(0, 0, 0);
+      let n = 0;
+      for (const id of focusIds) {
+        const p = live.get(id);
+        if (p) {
+          target.current.add(p);
+          n += 1;
+        }
+      }
+      if (n === 0) return;
+      target.current.multiplyScalar(1 / n);
+      const t = target.current;
+      c.target.lerp(t, k);
+      const dist = Math.max(1.42, t.length() + approach);
+      desired.current.copy(t).setLength(dist);
       camera.position.lerp(desired.current, k * 0.95);
     } else {
       c.target.lerp(new THREE.Vector3(0, 0, 0), k * 0.6);
