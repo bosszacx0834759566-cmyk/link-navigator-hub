@@ -1,0 +1,1066 @@
+'use client';
+
+import { Canvas, useFrame, useLoader, type ThreeEvent } from '@react-three/fiber';
+import { Html, OrbitControls, Stars } from '@react-three/drei';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three';
+
+import earthDay from '@/assets/earth_atmos_2048.jpg';
+import earthNight from '@/assets/earth_lights_2048.png';
+import earthClouds from '@/assets/earth_clouds_1024.png';
+import earthSpec from '@/assets/earth_specular_2048.jpg';
+import {
+  ASSET_BY_ID,
+  ASSETS,
+  TECH_META,
+  geoToVec,
+  routeSegments,
+  type Asset,
+  type LinkState,
+  type ScenarioProfile,
+  type Segment,
+  type WeatherCell,
+} from '@/lib/ololink';
+import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+
+const CYAN = '#38bdf8';
+const UP = new THREE.Vector3(0, 1, 0);
+
+function vec(a: Asset) {
+  return new THREE.Vector3(...geoToVec(a.lat, a.lon, a.altKm));
+}
+
+/** Quaternion that stands an object up on the sphere surface. */
+function surfaceQuat(position: THREE.Vector3) {
+  return new THREE.Quaternion().setFromUnitVectors(UP, position.clone().normalize());
+}
+
+const LIFT: Record<'optical' | 'radio' | 'fiber', number> = {
+  optical: 0.05,
+  radio: 0.34,
+  fiber: 0.006,
+};
+
+function curveFor(from: Asset, to: Asset, family: 'optical' | 'radio' | 'fiber') {
+  const a = vec(from);
+  const b = vec(to);
+  const mid = a.clone().add(b).multiplyScalar(0.5);
+  const lift = 1 + a.distanceTo(b) * LIFT[family];
+  mid.setLength(Math.max(a.length(), b.length()) * lift);
+  return new THREE.QuadraticBezierCurve3(a, mid, b);
+}
+
+function curveForSegment(segment: Segment) {
+  const from = ASSET_BY_ID[segment.from]!;
+  const to = ASSET_BY_ID[segment.to]!;
+  return curveFor(from, to, TECH_META[segment.tech].family);
+}
+
+/* ---------------------------------------------------------------- Earth */
+
+/** Direction of the sun — chosen so the terminator crosses both regions. */
+export const SUN_DIR = new THREE.Vector3(...geoToVec(14, 178, 0)).normalize();
+
+function Earth() {
+  const maps = useLoader(THREE.TextureLoader, [earthDay, earthNight, earthClouds, earthSpec]);
+  const day = maps[0]!;
+  const night = maps[1]!;
+  const clouds = maps[2]!;
+  const spec = maps[3]!;
+  day.colorSpace = THREE.SRGBColorSpace;
+  night.colorSpace = THREE.SRGBColorSpace;
+
+  const cloudRef = useRef<THREE.Mesh>(null);
+  useFrame((_, d) => {
+    if (cloudRef.current) cloudRef.current.rotation.y += d * 0.004;
+  });
+
+  return (
+    <group>
+      {/* realistic surface: satellite albedo, sun-lit */}
+      <mesh>
+        <sphereGeometry args={[1, 128, 128]} />
+        <meshStandardMaterial
+          map={day}
+          roughnessMap={spec}
+          metalness={0.05}
+          roughness={0.82}
+          color="#e6eef5"
+        />
+      </mesh>
+      {/* city lights — additive, masked to the night hemisphere only */}
+      <mesh scale={1.001}>
+        <sphereGeometry args={[1, 96, 96]} />
+        <shaderMaterial
+          transparent
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+          uniforms={{ uMap: { value: night }, uSun: { value: SUN_DIR } }}
+          vertexShader={`
+            varying vec2 vUv; varying vec3 vN;
+            void main() {
+              vUv = uv; vN = normalize(mat3(modelMatrix) * normal);
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }`}
+          fragmentShader={`
+            uniform sampler2D uMap; uniform vec3 uSun;
+            varying vec2 vUv; varying vec3 vN;
+            void main() {
+              float nightMask = smoothstep(0.12, -0.22, dot(vN, normalize(uSun)));
+              vec3 c = texture2D(uMap, vUv).rgb;
+              gl_FragColor = vec4(c * vec3(1.0, 0.82, 0.55) * nightMask * 0.9, 1.0);
+            }`}
+        />
+      </mesh>
+
+      {/* cloud layer */}
+      <mesh ref={cloudRef} scale={1.006}>
+        <sphereGeometry args={[1, 96, 96]} />
+        <meshStandardMaterial
+          map={clouds}
+          alphaMap={clouds}
+          transparent
+          opacity={0.42}
+          depthWrite={false}
+          color="#dfe7ee"
+          roughness={1}
+        />
+      </mesh>
+      {/* inner atmosphere */}
+      <mesh>
+        <sphereGeometry args={[1.016, 64, 64]} />
+        <meshBasicMaterial color="#4a86c8" transparent opacity={0.07} side={THREE.BackSide} />
+      </mesh>
+      {/* outer halo */}
+      <mesh>
+        <sphereGeometry args={[1.08, 64, 64]} />
+        <meshBasicMaterial color="#1d4e8f" transparent opacity={0.06} side={THREE.BackSide} />
+      </mesh>
+    </group>
+  );
+}
+
+
+/* --------------------------------------------- orbital trajectory rings */
+/* Deliberately near-invisible: these are mechanics, not communication. */
+
+function OrbitRing({ radius, tilt, spin }: { radius: number; tilt: number; spin: number }) {
+  const geometry = useMemo(() => {
+    const pts = Array.from({ length: 161 }, (_, i) => {
+      const a = (i / 160) * Math.PI * 2;
+      return new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius);
+    });
+    const g = new THREE.BufferGeometry().setFromPoints(pts);
+    g.computeBoundingSphere();
+    return g;
+  }, [radius]);
+  const ref = useRef<THREE.Object3D>(null);
+  useFrame((_, d) => {
+    if (ref.current) ref.current.rotation.y += d * spin;
+  });
+  return (
+    // @ts-expect-error three line primitive
+    <line ref={ref} geometry={geometry} rotation={[tilt, 0, tilt * 0.4]}>
+      <lineBasicMaterial color="#7dd3fc" transparent opacity={0.055} depthWrite={false} />
+    </line>
+  );
+}
+
+/* --------------------------------------------------- link helper meshes */
+
+function usePoints(curve: THREE.Curve<THREE.Vector3>, count = 72) {
+  return useMemo(() => curve.getPoints(count), [curve, count]);
+}
+
+function SolidLine({
+  points,
+  color,
+  opacity,
+}: {
+  points: THREE.Vector3[];
+  color: string;
+  opacity: number;
+}) {
+  const geometry = useMemo(() => new THREE.BufferGeometry().setFromPoints(points), [points]);
+  return (
+    // @ts-expect-error three line primitive
+    <line geometry={geometry}>
+      <lineBasicMaterial color={color} transparent opacity={opacity} depthWrite={false} />
+    </line>
+  );
+}
+
+/** Interrupted stroke — used for blocked / unavailable paths. */
+function DashedLine({
+  points,
+  color,
+  opacity,
+  dash = 0.02,
+  gap = 0.03,
+}: {
+  points: THREE.Vector3[];
+  color: string;
+  opacity: number;
+  dash?: number;
+  gap?: number;
+}) {
+  const geometry = useMemo(() => {
+    const g = new THREE.BufferGeometry().setFromPoints(points);
+    return g;
+  }, [points]);
+  const ref = useRef<THREE.Object3D & { computeLineDistances?: () => void }>(null);
+  useEffect(() => {
+    (ref.current as unknown as THREE.Line | null)?.computeLineDistances();
+  }, [geometry]);
+  return (
+    // @ts-expect-error three line primitive
+    <line ref={ref} geometry={geometry}>
+      <lineDashedMaterial
+        color={color}
+        transparent
+        opacity={opacity}
+        dashSize={dash}
+        gapSize={gap}
+        depthWrite={false}
+      />
+    </line>
+  );
+}
+
+/** Focused laser beam: taut, additive, with fast travelling photon packets. */
+function OpticalBeam({
+  curve,
+  color,
+  strength,
+}: {
+  curve: THREE.Curve<THREE.Vector3>;
+  color: string;
+  strength: number;
+}) {
+  const packs = useRef<THREE.Group>(null);
+  const offsets = useMemo(() => [0, 0.34, 0.67], []);
+  const t = useRef(Math.random());
+
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.55) % 1;
+    if (!packs.current) return;
+    packs.current.children.forEach((child, i) => {
+      const p = (t.current + offsets[i]!) % 1;
+      const pt = curve.getPointAt(p);
+      child.position.copy(pt);
+      const ahead = curve.getPointAt(Math.min(0.999, p + 0.02));
+      child.lookAt(ahead);
+    });
+  });
+
+  return (
+    <group>
+      {/* hard core */}
+      <mesh>
+        <tubeGeometry args={[curve, 48, 0.0022, 6, false]} />
+        <meshBasicMaterial
+          color="#e0f2fe"
+          transparent
+          opacity={0.75 * strength}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* glow sheath */}
+      <mesh>
+        <tubeGeometry args={[curve, 48, 0.008, 8, false]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.22 * strength}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+        />
+      </mesh>
+      <group ref={packs}>
+        {offsets.map((o) => (
+          <mesh key={o}>
+            <cylinderGeometry args={[0.0035, 0.0035, 0.05, 6]} />
+            <meshBasicMaterial
+              color="#f0f9ff"
+              transparent
+              opacity={0.9 * strength}
+              blending={THREE.AdditiveBlending}
+              depthWrite={false}
+            />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+/** Radio / microwave: bowed corridor carrying expanding wavefronts. */
+function RadioWave({
+  curve,
+  color,
+  strength,
+}: {
+  curve: THREE.Curve<THREE.Vector3>;
+  color: string;
+  strength: number;
+}) {
+  const points = usePoints(curve, 64);
+  const rings = useRef<THREE.Group>(null);
+  const offsets = useMemo(() => [0, 0.25, 0.5, 0.75], []);
+  const t = useRef(Math.random());
+
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.24) % 1;
+    if (!rings.current) return;
+    rings.current.children.forEach((child, i) => {
+      const p = (t.current + offsets[i]!) % 1;
+      child.position.copy(curve.getPointAt(p));
+      const tan = curve.getTangentAt(p);
+      child.lookAt(child.position.clone().add(tan));
+      const s = 0.6 + Math.sin(p * Math.PI) * 1.4;
+      child.scale.setScalar(s);
+      const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+      mat.opacity = Math.sin(p * Math.PI) * 0.7 * strength;
+    });
+  });
+
+  return (
+    <group>
+      <SolidLine points={points} color={color} opacity={0.5 * strength} />
+      <mesh>
+        <tubeGeometry args={[curve, 40, 0.014, 8, false]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.07 * strength}
+          depthWrite={false}
+        />
+      </mesh>
+      <group ref={rings}>
+        {offsets.map((o) => (
+          <mesh key={o}>
+            <torusGeometry args={[0.014, 0.0022, 6, 24]} />
+            <meshBasicMaterial color={color} transparent opacity={0.5} depthWrite={false} />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+/** Terrestrial fiber: steady surface-hugging conduit. */
+function FiberRun({
+  curve,
+  color,
+  strength,
+}: {
+  curve: THREE.Curve<THREE.Vector3>;
+  color: string;
+  strength: number;
+}) {
+  const pulse = useRef<THREE.Mesh>(null);
+  const t = useRef(Math.random());
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.4) % 1;
+    if (pulse.current) pulse.current.position.copy(curve.getPointAt(t.current));
+  });
+  return (
+    <group>
+      <mesh>
+        <tubeGeometry args={[curve, 32, 0.0035, 6, false]} />
+        <meshBasicMaterial color={color} transparent opacity={0.8 * strength} depthWrite={false} />
+      </mesh>
+      <mesh ref={pulse}>
+        <sphereGeometry args={[0.007, 10, 10]} />
+        <meshBasicMaterial color="#d1fae5" transparent opacity={0.9 * strength} />
+      </mesh>
+    </group>
+  );
+}
+
+/* ---------------------------------------------------------------- links */
+
+function LinkPath({
+  link,
+  selected,
+  onRoute,
+  highlighted,
+  onSelect,
+}: {
+  link: LinkState;
+  selected: boolean;
+  onRoute: boolean;
+  highlighted: boolean;
+  onSelect: (s: Selection) => void;
+}) {
+  const meta = TECH_META[link.segment.tech];
+  const curve = useMemo(() => curveForSegment(link.segment), [link.segment]);
+  const points = usePoints(curve, 64);
+  const active = link.status === 'ACTIVE';
+  const degraded = link.status === 'DEGRADED';
+  const rerouting = link.status === 'REROUTING';
+  const blocked = link.status === 'UNAVAILABLE';
+  const strength = highlighted || selected ? 1.35 : onRoute ? 1 : 0.75;
+
+  return (
+    <group>
+      {active || rerouting || degraded ? (
+        <group>
+          {meta.family === 'optical' ? (
+            <OpticalBeam
+              curve={curve}
+              color={rerouting ? '#e0f2fe' : degraded ? '#fbbf24' : meta.color}
+              strength={degraded ? strength * 0.55 : strength}
+            />
+          ) : meta.family === 'fiber' ? (
+            <FiberRun curve={curve} color={rerouting ? '#e0f2fe' : meta.color} strength={strength} />
+          ) : (
+            <RadioWave
+              curve={curve}
+              color={rerouting ? '#e0f2fe' : degraded ? '#fbbf24' : meta.color}
+              strength={degraded ? strength * 0.6 : strength}
+            />
+          )}
+          {degraded && (
+            <DashedLine points={points} color="#fbbf24" opacity={0.32} dash={0.04} gap={0.03} />
+          )}
+        </group>
+      ) : blocked ? (
+        <group>
+          <DashedLine points={points} color="#fb7185" opacity={selected ? 0.45 : 0.2} />
+          <mesh position={curve.getPointAt(0.5)}>
+            <sphereGeometry args={[0.006, 8, 8]} />
+            <meshBasicMaterial color="#fb7185" transparent opacity={selected ? 0.8 : 0.35} />
+          </mesh>
+        </group>
+      ) : (
+        <DashedLine
+          points={points}
+          color={meta.color}
+          opacity={selected ? 0.4 : 0.1}
+          dash={0.05}
+          gap={0.05}
+        />
+
+      )}
+
+      {/* generous click target */}
+      <mesh
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onSelect({ type: 'link', id: link.segment.id });
+        }}
+      >
+        <tubeGeometry args={[curve, 24, 0.016, 6, false]} />
+        <meshBasicMaterial
+          color={meta.color}
+          transparent
+          opacity={selected ? 0.16 : 0.01}
+          depthWrite={false}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+/* -------------------------------------------- route reveal / route ghost */
+
+function ProgressiveRoute({
+  segments,
+  seq,
+  mode,
+  color,
+}: {
+  segments: Segment[];
+  seq: number;
+  mode: 'in' | 'out';
+  color: string;
+}) {
+  const geometries = useMemo(
+    () =>
+      segments.map((s) => {
+        const pts = curveForSegment(s).getPoints(64);
+        return new THREE.BufferGeometry().setFromPoints(pts);
+      }),
+    [segments]
+  );
+  const group = useRef<THREE.Group>(null);
+  const t = useRef(0);
+
+  useEffect(() => {
+    t.current = 0;
+  }, [seq, segments]);
+
+  useFrame((_, d) => {
+    t.current = Math.min(1, t.current + d / (mode === 'in' ? 1.5 : 2.6));
+    const g = group.current;
+    if (!g) return;
+    g.children.forEach((child, i) => {
+      const line = child as THREE.Line;
+      const total = 65;
+      const span = 1 / Math.max(1, geometries.length);
+      const local = Math.min(1, Math.max(0, (t.current - i * span) / span));
+      const mat = line.material as THREE.LineBasicMaterial;
+      if (mode === 'in') {
+        line.geometry.setDrawRange(0, Math.round(total * local));
+        mat.opacity = local * (1 - Math.max(0, t.current - 0.75) * 3.4) * 0.95;
+      } else {
+        line.geometry.setDrawRange(0, total);
+        mat.opacity = Math.max(0, 0.5 * (1 - t.current));
+      }
+    });
+  });
+
+  return (
+    <group ref={group}>
+      {geometries.map((g, i) => (
+        // @ts-expect-error three line primitive
+        <line key={i} geometry={g}>
+          <lineBasicMaterial
+            color={color}
+            transparent
+            opacity={0}
+            depthWrite={false}
+            {...(mode === 'in' ? { blending: THREE.AdditiveBlending } : {})}
+          />
+        </line>
+      ))}
+    </group>
+  );
+}
+
+/* -------------------------------------------------------- asset markers */
+
+const KIND_COLOR: Record<Asset['kind'], string> = {
+  satellite: '#7dd3fc',
+  haps: '#38bdf8',
+  drone: '#a5b4fc',
+  ground: '#34d399',
+  customer: '#e2e8f0',
+};
+
+function Satellite({ s, color }: { s: number; color: string }) {
+  const ref = useRef<THREE.Group>(null);
+  useFrame((_, d) => {
+    if (ref.current) ref.current.rotation.y += d * 0.5;
+  });
+  return (
+    <group ref={ref}>
+      <mesh>
+        <boxGeometry args={[s * 0.9, s * 0.7, s * 0.7]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+      {[-1, 1].map((dir) => (
+        <mesh key={dir} position={[dir * s * 1.35, 0, 0]}>
+          <boxGeometry args={[s * 1.6, s * 0.06, s * 0.8]} />
+          <meshBasicMaterial color="#1e3a8a" />
+        </mesh>
+      ))}
+      {/* downlink aperture */}
+      <mesh position={[0, -s * 0.55, 0]} rotation={[Math.PI, 0, 0]}>
+        <coneGeometry args={[s * 0.35, s * 0.4, 10, 1, true]} />
+        <meshBasicMaterial color={color} side={THREE.DoubleSide} transparent opacity={0.8} />
+      </mesh>
+    </group>
+  );
+}
+
+function Haps({ s, color }: { s: number; color: string }) {
+  const ref = useRef<THREE.Group>(null);
+  useFrame(({ clock }) => {
+    if (ref.current) {
+      ref.current.rotation.y = Math.sin(clock.elapsedTime * 0.25) * 0.5;
+      ref.current.position.y = Math.sin(clock.elapsedTime * 0.7) * s * 0.15;
+    }
+  });
+  return (
+    <group ref={ref}>
+      {/* stratospheric wing */}
+      <mesh scale={[3.1, 0.3, 0.85]}>
+        <sphereGeometry args={[s * 0.62, 16, 12]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+      {/* twin gondolas */}
+      {[-1, 1].map((dir) => (
+        <mesh key={dir} position={[dir * s * 0.8, -s * 0.32, 0]}>
+          <capsuleGeometry args={[s * 0.11, s * 0.34, 4, 8]} />
+          <meshBasicMaterial color="#bae6fd" />
+        </mesh>
+      ))}
+      {/* tail fin */}
+      <mesh position={[0, s * 0.2, -s * 0.5]}>
+        <boxGeometry args={[s * 0.06, s * 0.42, s * 0.3]} />
+        <meshBasicMaterial color="#bae6fd" />
+      </mesh>
+      {/* station-keeping footprint */}
+      <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <torusGeometry args={[s * 1.5, s * 0.02, 6, 32]} />
+        <meshBasicMaterial color={color} transparent opacity={0.35} />
+      </mesh>
+    </group>
+  );
+}
+
+function Drone({ s, color }: { s: number; color: string }) {
+  const rotors = useRef<THREE.Group>(null);
+  useFrame((_, d) => {
+    if (rotors.current) rotors.current.rotation.y += d * 6;
+  });
+  const arms: [number, number][] = [
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+  ];
+  return (
+    <group>
+      <mesh>
+        <boxGeometry args={[s * 0.55, s * 0.28, s * 0.55]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+      {[0, Math.PI / 2].map((r) => (
+        <mesh key={r} rotation={[0, r, 0]}>
+          <boxGeometry args={[s * 2, s * 0.05, s * 0.07]} />
+          <meshBasicMaterial color="#c7d2fe" />
+        </mesh>
+      ))}
+      <group ref={rotors}>
+        {arms.map(([x, z]) => (
+          <mesh
+            key={`${x}${z}`}
+            position={[x * s * 0.72, s * 0.06, z * s * 0.72]}
+            rotation={[Math.PI / 2, 0, 0]}
+          >
+            <torusGeometry args={[s * 0.34, s * 0.02, 5, 16]} />
+            <meshBasicMaterial color="#e0e7ff" transparent opacity={0.85} />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+function GroundStation({ s, color }: { s: number; color: string }) {
+  const dish = useRef<THREE.Group>(null);
+  useFrame(({ clock }) => {
+    if (dish.current) dish.current.rotation.y = Math.sin(clock.elapsedTime * 0.2) * 0.7;
+  });
+  return (
+    <group>
+      {/* pad */}
+      <mesh position={[0, s * 0.05, 0]}>
+        <cylinderGeometry args={[s * 0.95, s * 1.05, s * 0.12, 12]} />
+        <meshBasicMaterial color="#0f766e" />
+      </mesh>
+      <group ref={dish} position={[0, s * 0.4, 0]}>
+        {/* mast */}
+        <mesh position={[0, -s * 0.18, 0]}>
+          <cylinderGeometry args={[s * 0.09, s * 0.11, s * 0.5, 8]} />
+          <meshBasicMaterial color="#5eead4" />
+        </mesh>
+        {/* parabolic dish, tilted skyward */}
+        <mesh rotation={[-0.75, 0, 0]}>
+          <coneGeometry args={[s * 0.85, s * 0.6, 18, 1, true]} />
+          <meshBasicMaterial color={color} side={THREE.DoubleSide} />
+        </mesh>
+        {/* feed horn */}
+        <mesh position={[0, s * 0.36, s * 0.3]}>
+          <sphereGeometry args={[s * 0.1, 8, 8]} />
+          <meshBasicMaterial color="#ecfeff" />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+function CustomerNode({ s, color }: { s: number; color: string }) {
+  const ring = useRef<THREE.Mesh>(null);
+  useFrame((_, d) => {
+    if (ring.current) ring.current.rotation.z += d * 0.6;
+  });
+  const spokes = [0, 1, 2, 3, 4].map((i) => (i / 5) * Math.PI * 2);
+  return (
+    <group>
+      {/* endpoint hub */}
+      <mesh position={[0, s * 0.3, 0]}>
+        <boxGeometry args={[s * 0.6, s * 0.6, s * 0.6]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+      {/* distribution ring with spokes */}
+      <group position={[0, s * 0.08, 0]} rotation={[Math.PI / 2, 0, 0]}>
+        <mesh ref={ring}>
+          <torusGeometry args={[s * 1, s * 0.045, 6, 28]} />
+          <meshBasicMaterial color="#94a3b8" />
+        </mesh>
+        {spokes.map((a) => (
+          <mesh key={a} position={[Math.cos(a) * s * 1, Math.sin(a) * s * 1, 0]}>
+            <boxGeometry args={[s * 0.18, s * 0.18, s * 0.18]} />
+            <meshBasicMaterial color="#cbd5e1" />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+function AssetNode({
+  asset,
+  selected,
+  onRoute,
+  onSelect,
+  showLabel,
+}: {
+  asset: Asset;
+  selected: boolean;
+  onRoute: boolean;
+  onSelect: (s: Selection) => void;
+  showLabel: boolean;
+}) {
+  const [hover, setHover] = useState(false);
+  const position = useMemo(() => vec(asset), [asset]);
+  const quat = useMemo(() => surfaceQuat(position), [position]);
+  const ring = useRef<THREE.Mesh>(null);
+  const body = useRef<THREE.Group>(null);
+  const color = selected || hover ? '#ffffff' : KIND_COLOR[asset.kind];
+
+  const s =
+    asset.kind === 'satellite'
+      ? 0.019
+      : asset.kind === 'haps'
+        ? 0.017
+        : asset.kind === 'drone'
+          ? 0.014
+          : 0.015;
+
+  useFrame(({ clock, camera }) => {
+    if (body.current) {
+      const target = selected ? 1.45 : hover ? 1.2 : 1;
+      body.current.scale.lerp(new THREE.Vector3(target, target, target), 0.12);
+    }
+    if (ring.current) {
+      ring.current.lookAt(camera.position);
+      const p = (clock.elapsedTime * 0.55) % 1;
+      ring.current.scale.setScalar(1 + p * 2.6);
+      (ring.current.material as THREE.MeshBasicMaterial).opacity =
+        (1 - p) * (selected ? 0.55 : onRoute ? 0.28 : 0);
+    }
+  });
+
+  return (
+    <group position={position} quaternion={quat}>
+      <group
+        ref={body}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+        }}
+        onPointerOut={() => setHover(false)}
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onSelect({ type: 'asset', id: asset.id });
+        }}
+      >
+        {/* invisible hit sphere so tiny models stay clickable */}
+        <mesh visible={false}>
+          <sphereGeometry args={[s * 2.2, 8, 8]} />
+        </mesh>
+        {asset.kind === 'satellite' ? (
+          <Satellite s={s} color={color} />
+        ) : asset.kind === 'haps' ? (
+          <Haps s={s} color={color} />
+        ) : asset.kind === 'drone' ? (
+          <Drone s={s} color={color} />
+        ) : asset.kind === 'ground' ? (
+          <GroundStation s={s} color={color} />
+        ) : (
+          <CustomerNode s={s} color={color} />
+        )}
+      </group>
+
+      <mesh ref={ring}>
+        <ringGeometry args={[s * 1.9, s * 2.2, 32]} />
+        <meshBasicMaterial
+          color={KIND_COLOR[asset.kind]}
+          transparent
+          opacity={0}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+
+      {(showLabel || hover || selected) && (
+        <Html center distanceFactor={1.6} position={[0, s * 4.4, 0]} zIndexRange={[20, 0]}>
+          <div
+            className={`pointer-events-none select-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.18em] transition-opacity ${
+              selected || hover ? 'text-foreground' : 'text-foreground/55'
+            }`}
+          >
+            {asset.name}
+          </div>
+        </Html>
+      )}
+    </group>
+  );
+}
+
+/* -------------------------------------------------------------- weather */
+
+function WeatherBlob({ cell }: { cell: WeatherCell }) {
+  const position = useMemo(() => new THREE.Vector3(...geoToVec(cell.lat, cell.lon, 4)), [cell]);
+  const ref = useRef<THREE.Group>(null);
+  const color = cell.kind === 'STORM' ? '#f43f5e' : cell.kind === 'RAIN' ? '#38bdf8' : '#cbd5e1';
+
+  useFrame(({ clock }) => {
+    if (ref.current) {
+      const p = 1 + Math.sin(clock.elapsedTime * 1.2 + cell.lat) * 0.06;
+      ref.current.scale.setScalar(p);
+      ref.current.rotation.y += 0.0008;
+    }
+  });
+
+  return (
+    <group ref={ref} position={position}>
+      <mesh>
+        <sphereGeometry args={[cell.size * 0.5, 24, 24]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.05 + cell.severity / 2200}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+        />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[cell.size * 0.3, 20, 20]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.07}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+        />
+      </mesh>
+      <AffectedFootprint cell={cell} color={color} />
+    </group>
+  );
+}
+
+/** Ground footprint of a weather cell — the area operators must route around. */
+function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }) {
+  const position = useMemo(
+    () => new THREE.Vector3(...geoToVec(cell.lat, cell.lon, 0)).multiplyScalar(1.002),
+    [cell]
+  );
+  const quat = useMemo(() => {
+    const q = new THREE.Quaternion();
+    q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), position.clone().normalize());
+    return q;
+  }, [position]);
+  const ring = useRef<THREE.Mesh>(null);
+  const r = cell.size * 0.62;
+
+  useFrame(({ clock }) => {
+    if (!ring.current) return;
+    const p = (clock.elapsedTime * 0.4 + cell.lon * 0.01) % 1;
+    ring.current.scale.setScalar(0.6 + p * 0.6);
+    (ring.current.material as THREE.MeshBasicMaterial).opacity = (1 - p) * 0.45;
+  });
+
+  return (
+    <group position={position.clone().sub(new THREE.Vector3(...geoToVec(cell.lat, cell.lon, 4)))} quaternion={quat}>
+      <mesh>
+        <ringGeometry args={[r * 0.92, r, 64]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.3}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+      <mesh ref={ring}>
+        <ringGeometry args={[r * 0.96, r, 64]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.3}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+
+/* --------------------------------------------------------- camera focus */
+
+function CameraRig({
+  target,
+  approach,
+  controls,
+}: {
+  target: THREE.Vector3 | null;
+  approach: number;
+  controls: React.RefObject<any>;
+}) {
+  const desired = useRef(new THREE.Vector3());
+  useFrame(({ camera }, d) => {
+    const c = controls.current;
+    if (!c) return;
+    const k = 1 - Math.exp(-2.6 * d);
+    if (target) {
+      c.target.lerp(target, k);
+      const dist = Math.max(1.42, target.length() + approach);
+      desired.current.copy(target).setLength(dist);
+      camera.position.lerp(desired.current, k * 0.95);
+    } else {
+      c.target.lerp(new THREE.Vector3(0, 0, 0), k * 0.6);
+    }
+    c.update();
+  });
+  return null;
+}
+
+/* ------------------------------------------------------------ the scene */
+
+function SceneContent({ state }: { state: OloLinkState }) {
+  const { profile, links, selection, select, layers, route, previousRoute, rerouteSeq } = state;
+  const controls = useRef<any>(null);
+
+  const routeSegmentIds = useMemo(() => new Set(route.map((s) => s.id)), [route]);
+  const routeAssets = useMemo(() => new Set(profile.route), [profile]);
+
+  /** selecting a link on the active route lights the whole path */
+  const highlightIds = useMemo(() => {
+    if (selection?.type !== 'link') return new Set<string>();
+    if (routeSegmentIds.has(selection.id)) return routeSegmentIds;
+    return new Set([selection.id]);
+  }, [selection, routeSegmentIds]);
+
+  const focus = useMemo(() => {
+    if (!selection) return null;
+    if (selection.type === 'asset') {
+      const a = ASSET_BY_ID[selection.id];
+      return a ? vec(a) : null;
+    }
+    const l = links.find((x) => x.segment.id === selection.id);
+    if (!l) return null;
+    const a = ASSET_BY_ID[l.segment.from]!;
+    const b = ASSET_BY_ID[l.segment.to]!;
+    return vec(a).add(vec(b)).multiplyScalar(0.5);
+  }, [selection, links]);
+
+  const approach = selection?.type === 'asset' ? 0.42 : 0.85;
+
+  return (
+    <>
+      {/* sun: gives a visible day / night terminator across both regions */}
+      <ambientLight intensity={0.22} />
+      <directionalLight
+        position={[SUN_DIR.x * 6, SUN_DIR.y * 6, SUN_DIR.z * 6]}
+        intensity={3.1}
+        color="#fff6e8"
+      />
+      {/* faint night-side fill so the dark hemisphere stays readable */}
+      <directionalLight
+        position={[-SUN_DIR.x * 6, -SUN_DIR.y * 6, -SUN_DIR.z * 6]}
+        intensity={0.16}
+        color="#2b4a72"
+      />
+      <Stars radius={90} depth={40} count={2200} factor={2.6} saturation={0} fade speed={0.3} />
+
+
+      <Suspense fallback={null}>
+        <Earth />
+      </Suspense>
+
+      {layers.orbits && (
+        <>
+          <OrbitRing radius={1.16} tilt={0.42} spin={0.02} />
+          <OrbitRing radius={1.22} tilt={-0.6} spin={-0.015} />
+          <OrbitRing radius={1.28} tilt={0.18} spin={0.01} />
+        </>
+      )}
+
+      {layers.routes &&
+        links.map((l) => (
+          <LinkPath
+            key={l.segment.id}
+            link={l}
+            selected={selection?.type === 'link' && selection.id === l.segment.id}
+            onRoute={routeSegmentIds.has(l.segment.id)}
+            highlighted={highlightIds.has(l.segment.id)}
+            onSelect={select}
+          />
+        ))}
+
+      {/* AI rerouting: old path dissolves, new path draws itself in */}
+      {layers.routes && previousRoute && previousRoute.length > 0 && (
+        <>
+          <ProgressiveRoute
+            key={`out-${rerouteSeq}`}
+            segments={previousRoute}
+            seq={rerouteSeq}
+            mode="out"
+            color="#94a3b8"
+          />
+          <ProgressiveRoute
+            key={`in-${rerouteSeq}`}
+            segments={route}
+            seq={rerouteSeq}
+            mode="in"
+            color="#e0f2fe"
+          />
+        </>
+      )}
+
+      {ASSETS.map((a) => (
+        <AssetNode
+          key={a.id}
+          asset={a}
+          selected={selection?.type === 'asset' && selection.id === a.id}
+          onRoute={routeAssets.has(a.id)}
+          onSelect={select}
+          showLabel={layers.labels && routeAssets.has(a.id)}
+        />
+      ))}
+
+      {layers.weather && profile.weather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
+
+      <OrbitControls
+        ref={controls}
+        enablePan={false}
+        enableDamping
+        dampingFactor={0.08}
+        rotateSpeed={0.45}
+        minDistance={1.18}
+        maxDistance={5}
+        autoRotate={!selection && state.running}
+        autoRotateSpeed={0.22}
+      />
+      <CameraRig target={focus} approach={approach} controls={controls} />
+    </>
+  );
+}
+
+export function GlobeScene({ state }: { state: OloLinkState }) {
+  return (
+    <Canvas
+      /* framed over the Pacific so both Thailand and the United States are in view */
+      camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
+      dpr={[1, 2]}
+      gl={{ antialias: true }}
+      onPointerMissed={() => state.select(null)}
+      className="!absolute inset-0"
+    >
+      <color attach="background" args={['#000000']} />
+      <SceneContent state={state} />
+    </Canvas>
+  );
+}
+
+
+export { routeSegments };
+export type { ScenarioProfile };
