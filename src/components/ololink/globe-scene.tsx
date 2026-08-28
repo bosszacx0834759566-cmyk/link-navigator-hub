@@ -944,19 +944,26 @@ function AssetNode({
   onRoute,
   onSelect,
   showLabel,
+  live,
+  linking,
 }: {
   asset: Asset;
   selected: boolean;
   onRoute: boolean;
   onSelect: (s: Selection) => void;
   showLabel: boolean;
+  live: LiveMap;
+  /** node is inside an active communication window */
+  linking?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const position = useMemo(() => vec(asset), [asset]);
   const quat = useMemo(() => surfaceQuat(position), [position]);
   const ring = useRef<THREE.Mesh>(null);
   const body = useRef<THREE.Group>(null);
-  const color = selected || hover ? '#ffffff' : KIND_COLOR[asset.kind];
+  const root = useRef<THREE.Group>(null);
+  const orbiting = asset.kind === 'satellite';
+  const color = selected || hover ? '#ffffff' : linking ? '#e0f2fe' : KIND_COLOR[asset.kind];
 
   const s =
     asset.kind === 'satellite'
@@ -968,6 +975,13 @@ function AssetNode({
           : 0.015;
 
   useFrame(({ clock, camera }) => {
+    if (root.current) {
+      const p = live.get(asset.id);
+      if (p) {
+        root.current.position.copy(p);
+        if (orbiting) root.current.quaternion.copy(surfaceQuat(p));
+      }
+    }
     if (body.current) {
       const target = selected ? 1.45 : hover ? 1.2 : 1;
       body.current.scale.lerp(new THREE.Vector3(target, target, target), 0.12);
@@ -977,12 +991,12 @@ function AssetNode({
       const p = (clock.elapsedTime * 0.55) % 1;
       ring.current.scale.setScalar(1 + p * 2.6);
       (ring.current.material as THREE.MeshBasicMaterial).opacity =
-        (1 - p) * (selected ? 0.55 : onRoute ? 0.28 : 0);
+        (1 - p) * (selected ? 0.55 : linking ? 0.42 : onRoute ? 0.28 : 0);
     }
   });
 
   return (
-    <group position={position} quaternion={quat}>
+    <group ref={root} position={position} quaternion={quat}>
       <group
         ref={body}
         onPointerOver={(e) => {
@@ -1015,7 +1029,7 @@ function AssetNode({
       <mesh ref={ring}>
         <ringGeometry args={[s * 1.9, s * 2.2, 32]} />
         <meshBasicMaterial
-          color={KIND_COLOR[asset.kind]}
+          color={linking ? '#e0f2fe' : KIND_COLOR[asset.kind]}
           transparent
           opacity={0}
           side={THREE.DoubleSide}
