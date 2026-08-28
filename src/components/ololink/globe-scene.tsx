@@ -22,6 +22,22 @@ import {
   type WeatherCell,
 } from '@/lib/ololink';
 import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+import {
+  DOWNLINK_TARGETS,
+  SAT_ORBITS,
+  SATELLITES,
+  orbitPosition,
+  orbitTangent,
+  staticPosition,
+  windowScore,
+} from '@/lib/orbits';
+
+/** Live scene positions for every asset — satellites are updated every frame. */
+type LiveMap = Map<string, THREE.Vector3>;
+
+function createLiveMap(): LiveMap {
+  return new Map(ASSETS.map((a) => [a.id, staticPosition(a)]));
+}
 
 const CYAN = '#38bdf8';
 const UP = new THREE.Vector3(0, 1, 0);
@@ -144,26 +160,74 @@ function Earth() {
 /* --------------------------------------------- orbital trajectory rings */
 /* Deliberately near-invisible: these are mechanics, not communication. */
 
-function OrbitRing({ radius, tilt, spin }: { radius: number; tilt: number; spin: number }) {
+function OrbitTrack({ elId }: { elId: string }) {
   const geometry = useMemo(() => {
-    const pts = Array.from({ length: 161 }, (_, i) => {
-      const a = (i / 160) * Math.PI * 2;
-      return new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius);
+    const el = SAT_ORBITS[elId]!;
+    const pts = Array.from({ length: 181 }, (_, i) => {
+      const a = (i / 180) * Math.PI * 2;
+      return el.e1
+        .clone()
+        .multiplyScalar(Math.cos(a) * el.radius)
+        .addScaledVector(el.e2, Math.sin(a) * el.radius);
     });
     const g = new THREE.BufferGeometry().setFromPoints(pts);
     g.computeBoundingSphere();
     return g;
-  }, [radius]);
-  const ref = useRef<THREE.Object3D>(null);
-  useFrame((_, d) => {
-    if (ref.current) ref.current.rotation.y += d * spin;
-  });
+  }, [elId]);
   return (
     // @ts-expect-error three line primitive
-    <line ref={ref} geometry={geometry} rotation={[tilt, 0, tilt * 0.4]}>
-      <lineBasicMaterial color="#7dd3fc" transparent opacity={0.055} depthWrite={false} />
+    <line geometry={geometry}>
+      <lineBasicMaterial color="#7dd3fc" transparent opacity={0.06} depthWrite={false} />
     </line>
   );
+}
+
+/**
+ * Propagates the visual LEO model and evaluates communication windows.
+ * Concept simulation only — circular paths, accelerated rates.
+ */
+function OrbitDriver({ state, live }: { state: OloLinkState; live: LiveMap }) {
+  const acc = useRef(0);
+  const tmp = useRef(new THREE.Vector3());
+
+  useFrame(({ clock }, d) => {
+    const t = clock.elapsedTime;
+    for (const sat of SATELLITES) {
+      const el = SAT_ORBITS[sat.id];
+      const target = live.get(sat.id);
+      if (el && target) orbitPosition(el, t, target);
+    }
+
+    if (!state.running) return;
+    acc.current += d;
+    if (acc.current < 0.5) return;
+    acc.current = 0;
+
+    for (const rx of DOWNLINK_TARGETS) {
+      const receiver = live.get(rx.id);
+      if (!receiver) continue;
+      let bestId: string | null = null;
+      let best = 0;
+      for (const satId of rx.sats) {
+        const pos = live.get(satId);
+        if (!pos) continue;
+        const score = windowScore(tmp.current.copy(pos), receiver);
+        if (score > best) {
+          best = score;
+          bestId = satId;
+        }
+      }
+      // hysteresis: hold an acquired link until the window really closes
+      const held = state.windows[rx.id] ?? null;
+      if (held && held !== bestId) {
+        const heldPos = live.get(held);
+        if (heldPos && windowScore(tmp.current.copy(heldPos), receiver) > 0.18) continue;
+      }
+      state.reportWindow(rx.id, best > 0.24 ? bestId : null);
+    }
+  });
+
+  return null;
 }
 
 /* --------------------------------------------------- link helper meshes */
