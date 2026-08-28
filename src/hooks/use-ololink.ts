@@ -106,6 +106,7 @@ export function useOloLink(): OloLinkState {
     FIBER: true,
   });
   const [telemetry, setTelemetry] = useState<Telemetry>(SCENARIOS.clear.telemetry);
+  const [windows, setWindows] = useState<Record<string, string | null>>({});
   const [events, setEvents] = useState<EventEntry[]>([
     { id: 'e0', time: 'T+00:00', level: 'INFO', text: 'Orchestration session initialised' },
     { id: 'e1', time: 'T+00:02', level: 'OK', text: 'Constellation handshake complete' },
@@ -114,6 +115,7 @@ export function useOloLink(): OloLinkState {
   const clock = useRef(0);
 
   const profile = SCENARIOS[scenarioId];
+
 
   const push = useCallback((level: EventEntry['level'], text: string) => {
     setEvents((prev) => {
