@@ -125,6 +125,26 @@ export function useOloLink(): OloLinkState {
     });
   }, []);
 
+  const reportWindow = useCallback(
+    (receiverId: string, satId: string | null) => {
+      setWindows((prev) => {
+        const current = prev[receiverId] ?? null;
+        if (current === satId) return prev;
+        const rx = ASSET_BY_ID[receiverId]?.name ?? receiverId;
+        if (satId && current) {
+          push('OK', `Handover ${ASSET_BY_ID[current]?.name ?? current} → ${ASSET_BY_ID[satId]?.name ?? satId} at ${rx}`);
+        } else if (satId) {
+          push('OK', `Comm window acquired: ${ASSET_BY_ID[satId]?.name ?? satId} → ${rx}`);
+        } else if (current) {
+          push('INFO', `Comm window closed: ${ASSET_BY_ID[current]?.name ?? current} → ${rx}`);
+        }
+        return { ...prev, [receiverId]: satId };
+      });
+    },
+    [push]
+  );
+
+
   useEffect(() => {
     if (!running) return;
     const t = setInterval(() => {
