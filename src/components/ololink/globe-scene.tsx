@@ -1202,17 +1202,24 @@ function SceneContent({ state }: { state: OloLinkState }) {
     return new Set([selection.id]);
   }, [selection, routeSegmentIds]);
 
+  const live = useMemo(createLiveMap, []);
+
+  /** satellites currently holding a communication window, by receiver */
+  const windowSats = useMemo(
+    () => new Set(Object.values(state.windows).filter(Boolean) as string[]),
+    [state.windows]
+  );
+  const windowReceivers = useMemo(
+    () => new Set(Object.entries(state.windows).filter(([, v]) => v).map(([k]) => k)),
+    [state.windows]
+  );
+
   const focus = useMemo(() => {
     if (!selection) return null;
-    if (selection.type === 'asset') {
-      const a = ASSET_BY_ID[selection.id];
-      return a ? vec(a) : null;
-    }
+    if (selection.type === 'asset') return [selection.id];
     const l = links.find((x) => x.segment.id === selection.id);
     if (!l) return null;
-    const a = ASSET_BY_ID[l.segment.from]!;
-    const b = ASSET_BY_ID[l.segment.to]!;
-    return vec(a).add(vec(b)).multiplyScalar(0.5);
+    return [l.segment.from, l.segment.to];
   }, [selection, links]);
 
   const approach = selection?.type === 'asset' ? 0.42 : 0.85;
@@ -1239,39 +1246,47 @@ function SceneContent({ state }: { state: OloLinkState }) {
         <Earth />
       </Suspense>
 
-      {layers.orbits && (
-        <>
-          <OrbitRing radius={1.16} tilt={0.42} spin={0.02} />
-          <OrbitRing radius={1.22} tilt={-0.6} spin={-0.015} />
-          <OrbitRing radius={1.28} tilt={0.18} spin={0.01} />
-        </>
-      )}
+      <OrbitDriver state={state} live={live} />
+
+      {layers.orbits && SATELLITES.map((a) => <OrbitTrack key={a.id} elId={a.id} />)}
 
       {layers.routes &&
-        links.map((l) => (
-          <LinkPath
-            key={l.segment.id}
-            link={l}
-            selected={selection?.type === 'link' && selection.id === l.segment.id}
-            onRoute={routeSegmentIds.has(l.segment.id)}
-            highlighted={highlightIds.has(l.segment.id)}
-            onSelect={select}
-          />
-        ))}
+        links.map((l) =>
+          ASSET_BY_ID[l.segment.from]?.kind === 'satellite' ? (
+            <DownlinkBeam
+              key={l.segment.id}
+              link={l}
+              live={live}
+              inWindow={state.windows[l.segment.to] === l.segment.from}
+              selected={selection?.type === 'link' && selection.id === l.segment.id}
+              highlighted={highlightIds.has(l.segment.id)}
+              onSelect={select}
+            />
+          ) : (
+            <LinkPath
+              key={l.segment.id}
+              link={l}
+              selected={selection?.type === 'link' && selection.id === l.segment.id}
+              onRoute={routeSegmentIds.has(l.segment.id)}
+              highlighted={highlightIds.has(l.segment.id)}
+              onSelect={select}
+            />
+          )
+        )}
 
       {/* AI rerouting: old path dissolves, new path draws itself in */}
       {layers.routes && previousRoute && previousRoute.length > 0 && (
         <>
           <ProgressiveRoute
             key={`out-${rerouteSeq}`}
-            segments={previousRoute}
+            segments={previousRoute.filter((sg) => ASSET_BY_ID[sg.from]?.kind !== 'satellite')}
             seq={rerouteSeq}
             mode="out"
             color="#94a3b8"
           />
           <ProgressiveRoute
             key={`in-${rerouteSeq}`}
-            segments={route}
+            segments={route.filter((sg) => ASSET_BY_ID[sg.from]?.kind !== 'satellite')}
             seq={rerouteSeq}
             mode="in"
             color="#e0f2fe"
@@ -1286,7 +1301,9 @@ function SceneContent({ state }: { state: OloLinkState }) {
           selected={selection?.type === 'asset' && selection.id === a.id}
           onRoute={routeAssets.has(a.id)}
           onSelect={select}
-          showLabel={layers.labels && routeAssets.has(a.id)}
+          showLabel={layers.labels && (routeAssets.has(a.id) || windowSats.has(a.id))}
+          live={live}
+          linking={windowSats.has(a.id) || windowReceivers.has(a.id)}
         />
       ))}
 
@@ -1303,7 +1320,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
         autoRotate={!selection && state.running}
         autoRotateSpeed={0.22}
       />
-      <CameraRig target={focus} approach={approach} controls={controls} />
+      <CameraRig focusIds={focus} live={live} approach={approach} controls={controls} />
     </>
   );
 }
